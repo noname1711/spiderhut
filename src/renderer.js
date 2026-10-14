@@ -1,0 +1,408 @@
+import {V,perspective,IDENTITY,rgba} from './math.js';
+import {canvasSize,QUALITY} from './quality.js';
+const VS=`#version 300 es
+precision highp float;
+layout(location=0) in vec3 aPos;
+layout(location=1) in vec3 aNormal;
+layout(location=2) in vec3 aColor;
+layout(location=3) in float aEmissive;
+uniform mat4 uProjection,uView,uModel;
+out vec3 vPosition,vNormal,vColor;
+out float vEmissive;
+void main(){
+  vec4 p=uModel*vec4(aPos,1.0);
+  vPosition=p.xyz;
+  vNormal=mat3(uModel)*aNormal;
+  vColor=aColor;
+  vEmissive=aEmissive;
+  gl_Position=uProjection*uView*p;
+}`;
+const FS=`#version 300 es
+precision highp float;
+in vec3 vPosition,vNormal,vColor;
+in float vEmissive;
+uniform vec3 uEye,uFogColor,uSun;
+uniform float uFogAmount,uMaterialQuality;
+out vec4 fragColor;
+float matNoise(vec3 p){return fract(sin(dot(floor(p),vec3(17.13,43.71,73.11)))*43758.5453);}
+void main(){
+  vec3 albedo=vColor;
+  // Signed material IDs occupy the normally nonnegative emissive slot.
+  if(vEmissive<-.5 && uMaterialQuality>.1){
+    if(vEmissive> -1.5){ // staggered terra-cotta roof tiles
+      vec2 tile=vec2(vPosition.x*1.22,vPosition.z*1.65);
+      tile.x+=0.5*mod(floor(tile.y),2.0);
+      float seamX=1.0-smoothstep(.025,.11,fract(tile.x));
+      float seamY=1.0-smoothstep(.025,.095,fract(tile.y));
+      float curve=sin(fract(tile.x)*3.14159);
+      float aged=matNoise(vec3(floor(tile),0.0));
+      albedo*=mix(0.72,1.10,curve)*mix(.79,1.12,aged);
+      albedo*=1.0-.25*max(seamX,seamY);
+    }else if(vEmissive> -2.5){ // weathered plaster / limewash
+      float mottled=matNoise(vPosition*vec3(.8,.6,.9));
+      float patina=matNoise(vPosition*vec3(2.1,1.9,1.8));
+      float stain=smoothstep(.30,.85,mottled)*(.14+.10*patina);
+      albedo*=1.04-stain;
+      albedo=mix(albedo,vec3(.16,.17,.15),stain*.12);
+    }else{ // small wet asphalt highlights in the rainy Old Quarter
+      float wet=sin(vPosition.x*3.8+sin(vPosition.z*.51))*sin(vPosition.z*1.72);
+      albedo*=.84+.15*max(0.0,wet);
+      albedo+=vec3(.08,.075,.11)*pow(max(wet,0.0),8.0)*.26;
+    }
+  }
+  vec3 n=normalize(vNormal);
+  vec3 sunDir=normalize(uSun);
+  vec3 viewDir=normalize(uEye-vPosition);
+  float ndv=max(dot(n,viewDir),0.0);
+  vec3 horizonTint=mix(vec3(0.18,0.19,0.24),uFogColor,0.80);
+  vec3 hemiSky=mix(vec3(0.24,0.30,0.42),uFogColor,0.58);
+  vec3 hemiGround=mix(vec3(0.09,0.07,0.08),uFogColor*0.35,0.38);
+  vec3 hemi=mix(hemiGround,hemiSky,clamp(n.y*0.5+0.5,0.0,1.0));
+  float diffuse=max(dot(n,sunDir),0.0);
+  float bounce=max(dot(n,normalize(vec3(-0.44,0.74,-0.28))),0.0);
+  float warm=max(dot(n,normalize(vec3(0.0,1.0,0.18))),0.0);
+  float rim=pow(1.0-ndv,2.25);
+  float fresnel=pow(1.0-ndv,4.0);
+  vec3 halfVec=normalize(sunDir+viewDir);
+  float specTight=pow(max(dot(n,halfVec),0.0),42.0);
+  float specBroad=pow(max(dot(n,halfVec),0.0),10.0);
+  float gloss=pow(max(dot(reflect(-sunDir,n),viewDir),0.0),94.0);
+  float upMask=clamp(n.y*0.5+0.5,0.0,1.0);
+  vec3 base=albedo*(0.18+0.68*diffuse+0.18*bounce)+hemi*0.46+albedo*warm*0.10;
+  vec3 color=base;
+  color += mix(vec3(0.38,0.33,0.28),uFogColor+vec3(0.12,0.09,0.04),0.58)*specTight*0.22;
+  color += mix(vec3(0.26,0.28,0.32),uFogColor+vec3(0.08),0.66)*gloss*0.26;
+  color += mix(vec3(0.20,0.22,0.26),uFogColor+vec3(0.04,0.03,0.02),0.45)*specBroad*0.08;
+  color += horizonTint*rim*0.24;
+  color += mix(vec3(0.20,0.25,0.34),uFogColor+vec3(0.08,0.04,0.03),0.25)*fresnel*0.32;
+  color += mix(vec3(0.08,0.10,0.14),uFogColor*0.22,0.40)*(1.0-upMask)*0.08;
+  color += albedo*max(vEmissive,0.0)*1.88;
+  float distanceFromEye=length(vPosition-uEye);
+  float fog=1.0-exp(-pow(distanceFromEye*uFogAmount,1.12));
+  float aerial=clamp(distanceFromEye*0.0018,0.0,1.0);
+  color=mix(color,color*mix(vec3(1.0),uFogColor+vec3(0.12,0.08,0.02),0.30),aerial*0.22);
+  color=mix(color,uFogColor,clamp(fog,0.0,0.965));
+  color=color/(color+vec3(0.42));
+  color=pow(color,vec3(0.92));
+  fragColor=vec4(color,1.0);
+}`;
+const SKY_VS=`#version 300 es
+precision highp float;
+out vec2 vUV;
+void main(){
+ vec2 p=vec2(gl_VertexID==1?3.0:-1.0,gl_VertexID==2?3.0:-1.0);
+ gl_Position=vec4(p,0.0,1.0);
+ vUV=(p+1.0)*0.5;
+}`;
+const SKY_FS=`#version 300 es
+precision highp float;
+in vec2 vUV;
+uniform vec3 uTop,uHorizon,uGlow;
+uniform vec2 uSunPos;
+uniform float uSunStrength,uAspect,uTime;
+out vec4 fragColor;
+float hash21(vec2 p){return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453123);}
+float noise(vec2 p){
+ vec2 i=floor(p),f=fract(p);
+ float a=hash21(i),b=hash21(i+vec2(1.0,0.0)),c=hash21(i+vec2(0.0,1.0)),d=hash21(i+vec2(1.0,1.0));
+ vec2 u=f*f*(3.0-2.0*f);
+ return mix(mix(a,b,u.x),mix(c,d,u.x),u.y);
+}
+void main(){
+ vec2 uv=vUV;
+ float h=smoothstep(0.08,0.92,uv.y);
+ vec3 color=mix(uHorizon,uTop,h);
+ // A low sun and layered atmospheric glow, no heavy postprocess pass.
+ vec2 delta=(uv-uSunPos)*vec2(uAspect,1.0);
+ float r=length(delta);
+ color+=uGlow*exp(-r*r*9.0)*uSunStrength*.27;
+ color+=uGlow*exp(-r*r*95.0)*uSunStrength*.21;
+ float disc=1.0-smoothstep(.023,.030,r);
+ color+=uGlow*disc*uSunStrength*.29;
+ // Layered cloud haze for a more romantic, cinematic skyline.
+ float cloudBase=noise(vec2(uv.x*uAspect*4.4+uTime*.006,uv.y*5.3));
+ float cloudDetail=noise(vec2(uv.x*uAspect*10.0+13.0+uTime*.011,uv.y*12.0-4.0));
+ float cloud=clamp(cloudBase*0.72+cloudDetail*0.28-0.43,0.0,1.0);
+ float cloudMask=smoothstep(0.18,0.82,uv.y)*(1.0-smoothstep(0.76,1.0,uv.y));
+ color=mix(color,color+mix(uHorizon,uGlow,0.36)*(0.18+0.26*uSunStrength),cloud*cloudMask*0.30);
+ // Slightly brighter and softer at the distant skyline.
+ float hDist=(uv.y-.21)*8.0;
+ float haze=exp(-hDist*hDist);
+ color=mix(color,uHorizon+uGlow*.09,haze*.12);
+ // Romantic mist ribbon near horizon and a gentle top falloff.
+ float mist=smoothstep(0.0,0.26,uv.y)*(1.0-smoothstep(0.26,0.58,uv.y));
+ color+=mix(uHorizon,uGlow,0.42)*mist*0.12;
+ color=mix(color,color*0.98,smoothstep(0.84,1.0,uv.y)*0.12);
+ // Lightweight stars for darker skies, especially useful in the rainy/night chapter.
+ float darkness=clamp((0.30-dot(uTop,vec3(0.333)))*6.0,0.0,1.0);
+ vec2 starUV=uv*vec2(120.0*uAspect,120.0);
+ vec2 cell=floor(starUV);
+ vec2 f=fract(starUV)-0.5;
+ float starStep=step(0.992,hash21(cell));
+ float star=starStep*(1.0-smoothstep(0.0,0.07,length(f)));
+ color+=vec3(0.55,0.65,0.90)*star*darkness*(1.0-smoothstep(0.36,0.78,uv.y))*0.55;
+ fragColor=vec4(clamp(color,0.0,1.0),1.0);
+}`;
+// Two-triangle water patches use their own physically inspired, animation-aware material.
+const WATER_VS=`#version 300 es
+precision highp float;
+layout(location=0) in vec3 aPos;
+uniform mat4 uProjection,uView;
+out vec3 vWorld;
+void main(){vWorld=aPos;gl_Position=uProjection*uView*vec4(aPos,1.0);}
+`;
+const WATER_FS=`#version 300 es
+precision highp float;
+in vec3 vWorld;
+uniform vec3 uEye,uFogColor,uSun,uSkyTop,uSkyHorizon,uSkyGlow;
+uniform float uFogAmount,uTime,uChapter,uWaterQuality;
+out vec4 fragColor;
+void main(){
+  vec2 p=vWorld.xz;
+  float t=uTime;
+  float waveA=sin(p.x*.24+p.y*.18+t*.55);
+  float waveB=sin(p.x*.62-p.y*.41+t*.82);
+  float waveC=sin(p.x*1.45+p.y*.92-t*1.35);
+  vec2 slope=vec2(.030*cos(p.x*.24+p.y*.18+t*.55),.022*cos(p.x*.24+p.y*.18+t*.55));
+  slope+=vec2(.055,-.040)*cos(p.x*.62-p.y*.41+t*.82);
+  if(uWaterQuality>.5)slope+=vec2(.030,.022)*cos(p.x*1.45+p.y*.92-t*1.35);
+  vec3 n=normalize(vec3(-slope.x,1.0,-slope.y));
+  vec3 viewDir=normalize(uEye-vWorld);
+  vec3 reflection=reflect(-viewDir,n);
+  float reflectedHeight=clamp(reflection.y,0.0,1.0);
+  vec3 sky=mix(uSkyHorizon,uSkyTop,smoothstep(.04,.90,reflectedHeight));
+  float fresnel=.05+.95*pow(1.0-max(dot(n,viewDir),0.0),4.0);
+  // Simpler blue water palette as requested: clean blue with only gentle variation.
+  // Chapter 1 leans into a poetic turquoise lake, while Chapter 3 stays calmer and river-like.
+  vec3 deep=vec3(.10,.45,.60);
+  vec3 shallow=vec3(.34,.73,.82);
+  if(uChapter>1.0){
+    deep=vec3(.11,.35,.50);
+    shallow=vec3(.24,.55,.72);
+  }
+  float tone=.5+.5*waveA;
+  vec3 water=mix(deep,shallow,tone*.56+(.5+.5*waveB)*.18);
+  vec3 col=mix(water,sky*.92+.015,fresnel*.62+.08);
+  vec3 sunDir=normalize(uSun);
+  float sunAlign=max(dot(reflection,sunDir),0.0);
+  float sunSoft=pow(sunAlign,18.0);
+  float sunSharp=pow(sunAlign,90.0);
+  float glitter=pow(max(0.0,.55+.25*waveB+.20*waveC),6.0);
+  vec3 highlight=mix(uChapter<1.0?vec3(.76,.97,.94):vec3(.78,.90,.98),uSkyGlow,.28);
+  float glint=(sunSoft*.18+sunSharp*.24)*(.55+.45*glitter);
+  col+=highlight*glint;
+  // Bank tint / under-bridge shade remain, but simpler and cleaner.
+  float bank=1.0-smoothstep(12.0,20.0,p.x);
+  if(uChapter<1.0)col=mix(col,col+vec3(.06,.11,.08),bank*.20);
+  else{
+    float bridgeShade=1.0-smoothstep(6.0,17.0,abs(p.x));
+    col*=1.0-.18*bridgeShade;
+  }
+  if(uWaterQuality>.5){
+    float ripple=sin(p.x*3.6+p.y*2.1+t*1.3)*sin(p.x*2.2-p.y*3.1-t*1.0);
+    col+=vec3(.12,.17,.20)*pow(max(ripple,0.0),9.0)*.08;
+  }
+  float dist=length(uEye-vWorld);
+  float fog=1.0-exp(-pow(dist*uFogAmount,.97));
+  col=mix(col,uFogColor,clamp(fog*.76,0.0,.82));
+  col=col/(col+vec3(.36));
+  col=pow(col,vec3(.94));
+  fragColor=vec4(col,1.0);
+}`;
+const RAIN_VS=`#version 300 es
+precision highp float;
+layout(location=0) in vec3 aPos;
+uniform mat4 uProjection,uView;
+uniform vec3 uEye;
+uniform float uTime;
+void main(){
+ vec3 p=aPos;
+ p.x+=uEye.x;
+ p.y+=uEye.y;
+ p.z+=uEye.z;
+ p.x+=mod(uTime*1.3+float(gl_VertexID%17)*.17,3.)-1.5;
+ p.y+=1.5-mod(uTime*8.0+float(gl_VertexID%23)*.74,13.0);
+ gl_Position=uProjection*uView*vec4(p,1.0);
+ gl_PointSize=1.25;
+}`;
+const RAIN_FS=`#version 300 es
+precision highp float;
+out vec4 fragColor;
+void main(){fragColor=vec4(0.70,0.83,1.,0.28);}`;
+function shader(gl,type,source){const s=gl.createShader(type);gl.shaderSource(s,source);gl.compileShader(s);if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))throw new Error(gl.getShaderInfoLog(s));return s;}
+function program(gl,vs,fs){const p=gl.createProgram();gl.attachShader(p,shader(gl,gl.VERTEX_SHADER,vs));gl.attachShader(p,shader(gl,gl.FRAGMENT_SHADER,fs));gl.linkProgram(p);if(!gl.getProgramParameter(p,gl.LINK_STATUS))throw new Error(gl.getProgramInfoLog(p));return p;}
+export class MeshBuilder {
+ constructor(detail=1){this.data=[];this.triangles=0;this.detail=detail;}
+ tri(a,b,c,color='#b7b7b7',em=0,normals){
+  const rgb=typeof color==='string'?rgba(color):color;
+  const n=V.norm(V.cross(V.sub(b,a),V.sub(c,a)));
+  for(const [i,p] of [a,b,c].entries()){
+   const nn=normals?.[i]??n;
+   this.data.push(p[0],p[1],p[2],nn[0],nn[1],nn[2],rgb[0],rgb[1],rgb[2],em);
+  }
+  this.triangles++;
+ }
+ quad(a,b,c,d,color,em=0){this.tri(a,b,c,color,em);this.tri(a,c,d,color,em);}
+ box(center,size,color='#777777',em=0,topColor=null){
+  const [x,y,z]=center,[w,h,d]=size;
+  const x0=x-w/2,x1=x+w/2,y0=y-h/2,y1=y+h/2,z0=z-d/2,z1=z+d/2;
+  const p=(x,y,z)=>[x,y,z];
+  this.quad(p(x1,y0,z0),p(x0,y0,z0),p(x0,y1,z0),p(x1,y1,z0),color,em);
+  this.quad(p(x0,y0,z1),p(x1,y0,z1),p(x1,y1,z1),p(x0,y1,z1),color,em);
+  this.quad(p(x0,y0,z0),p(x0,y0,z1),p(x0,y1,z1),p(x0,y1,z0),color,em);
+  this.quad(p(x1,y0,z1),p(x1,y0,z0),p(x1,y1,z0),p(x1,y1,z1),color,em);
+  this.quad(p(x0,y1,z0),p(x0,y1,z1),p(x1,y1,z1),p(x1,y1,z0),topColor||color,em);
+  this.quad(p(x1,y0,z0),p(x1,y0,z1),p(x0,y0,z1),p(x0,y0,z0),color,em);
+ }
+ ellipsoid(center,scale,color='#c72443',em=0,segments=15,rings=10){
+  segments=Math.max(6,Math.round(segments*this.detail));rings=Math.max(4,Math.round(rings*this.detail));
+  const [cx,cy,cz]=center,[sx,sy,sz]=scale;
+  const point=(i,j)=>{
+   const th=Math.PI*i/rings,ph=2*Math.PI*j/segments;
+   const n=[Math.sin(th)*Math.cos(ph),Math.cos(th),Math.sin(th)*Math.sin(ph)];
+   return [[cx+sx*n[0],cy+sy*n[1],cz+sz*n[2]],V.norm([n[0]/sx,n[1]/sy,n[2]/sz])];
+  };
+  for(let i=0;i<rings;i++)for(let j=0;j<segments;j++){
+   const a=point(i,j),b=point(i+1,j),c=point(i+1,j+1),d=point(i,j+1);
+   this.tri(a[0],b[0],c[0],color,em,[a[1],b[1],c[1]]);
+   this.tri(a[0],c[0],d[0],color,em,[a[1],c[1],d[1]]);
+  }
+ }
+ tube(points,radii,color='#d72440',segments=12,steps=0,em=0){
+  if(points.length<2)return;
+  segments=Math.max(5,Math.round(segments*this.detail));
+  const sample=[];
+  const count=Math.max(4,Math.round((steps||Math.max(4,(points.length-1)*6))*this.detail));
+  for(let i=0;i<=count;i++){
+   const f=i/count*(points.length-1),j=Math.min(points.length-2,Math.floor(f)),t=f-j;
+   // cubic Catmull-Rom with no external dependencies
+   const p0=points[Math.max(0,j-1)],p1=points[j],p2=points[j+1],p3=points[Math.min(points.length-1,j+2)];
+   const xyz=[0,1,2].map(k=>.5*((2*p1[k])+(-p0[k]+p2[k])*t+(2*p0[k]-5*p1[k]+4*p2[k]-p3[k])*t*t+(-p0[k]+3*p1[k]-3*p2[k]+p3[k])*t*t*t));
+   sample.push({p:xyz,r:radii[j]*(1-t)+radii[j+1]*t});
+  }
+  const rings=[];
+  for(let i=0;i<sample.length;i++){
+   const item=sample[i],tangent=V.norm(V.sub(sample[Math.min(sample.length-1,i+1)].p,sample[Math.max(0,i-1)].p));
+   let right=V.cross(tangent,[0,0,1]);if(V.len(right)<.1)right=V.cross(tangent,[0,1,0]);right=V.norm(right);
+   const up=V.norm(V.cross(tangent,right));
+   const ring=[];
+   for(let j=0;j<segments;j++){
+    let a=2*Math.PI*j/segments,n=V.add(V.scale(right,Math.cos(a)),V.scale(up,Math.sin(a)));
+    ring.push({p:V.add(item.p,V.scale(n,item.r)),n});
+   }
+   rings.push(ring);
+  }
+  for(let i=0;i<rings.length-1;i++)for(let j=0;j<segments;j++){
+   const a=rings[i][j],b=rings[i+1][j],c=rings[i+1][(j+1)%segments],d=rings[i][(j+1)%segments];
+   this.tri(a.p,b.p,c.p,color,em,[a.n,b.n,c.n]);
+   this.tri(a.p,c.p,d.p,color,em,[a.n,c.n,d.n]);
+  }
+  this.ellipsoid(points[0],[radii[0]*.95,radii[0]*.95,radii[0]*.95],color,em,8,6);
+  this.ellipsoid(points.at(-1),[radii.at(-1)*.8,radii.at(-1)*.8,radii.at(-1)*.8],color,em,8,6);
+ }
+ get count(){return this.data.length/10;}
+}
+export class Renderer {
+ constructor(canvas){
+  this.canvas=canvas;const gl=canvas.getContext('webgl2',{alpha:false,depth:true,antialias:true,stencil:false,powerPreference:'high-performance'});
+  if(!gl)throw new Error('Trình duyệt không hỗ trợ WebGL 2. Hãy bật tăng tốc phần cứng hoặc thử Chrome/Edge mới.');
+  this.gl=gl;this.quality='medium';this.program=program(gl,VS,FS);this.rainProgram=program(gl,RAIN_VS,RAIN_FS);
+  this.skyProgram=program(gl,SKY_VS,SKY_FS);this.skyVAO=gl.createVertexArray();
+  this.waterProgram=program(gl,WATER_VS,WATER_FS);
+  this.wu={};for(const n of ['uProjection','uView','uEye','uFogColor','uSun','uSkyTop','uSkyHorizon','uSkyGlow','uFogAmount','uTime','uChapter','uWaterQuality'])this.wu[n]=gl.getUniformLocation(this.waterProgram,n);
+  this.su={};for(const n of ['uTop','uHorizon','uGlow','uSunPos','uSunStrength','uAspect','uTime'])this.su[n]=gl.getUniformLocation(this.skyProgram,n);
+  this.u={};for(const n of ['uProjection','uView','uModel','uEye','uFogColor','uSun','uFogAmount','uMaterialQuality'])this.u[n]=gl.getUniformLocation(this.program,n);
+  this.ru={};for(const n of ['uProjection','uView','uEye','uTime'])this.ru[n]=gl.getUniformLocation(this.rainProgram,n);
+  this.clear=[0.035,0.047,0.115];
+  gl.enable(gl.DEPTH_TEST);gl.depthFunc(gl.LEQUAL);gl.disable(gl.CULL_FACE);
+  this.rain=this.makeRain();
+ }
+ mesh(builder,usage='static'){
+  const gl=this.gl;const vao=gl.createVertexArray(),vbo=gl.createBuffer();gl.bindVertexArray(vao);gl.bindBuffer(gl.ARRAY_BUFFER,vbo);
+  gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(builder.data),usage==='dynamic'?gl.DYNAMIC_DRAW:gl.STATIC_DRAW);
+  for(const [loc,size,offset] of [[0,3,0],[1,3,12],[2,3,24],[3,1,36]]){
+   gl.enableVertexAttribArray(loc);gl.vertexAttribPointer(loc,size,gl.FLOAT,false,40,offset);
+  }
+  gl.bindVertexArray(null);return {vao,vbo,count:builder.count,capacity:builder.data.length};
+ }
+ update(mesh,builder){
+  const gl=this.gl;gl.bindBuffer(gl.ARRAY_BUFFER,mesh.vbo);
+  const data=new Float32Array(builder.data);
+  if(data.length>mesh.capacity){gl.bufferData(gl.ARRAY_BUFFER,data,gl.DYNAMIC_DRAW);mesh.capacity=data.length;}
+  else gl.bufferSubData(gl.ARRAY_BUFFER,0,data);
+  mesh.count=builder.count;
+ }
+ delete(mesh){const g=this.gl;g.deleteBuffer(mesh.vbo);g.deleteVertexArray(mesh.vao);}
+ setQuality(profile){if(QUALITY[profile])this.quality=profile;}
+ resize(){
+  const dpr=typeof devicePixelRatio==='number'?devicePixelRatio:1;
+  const {width:w,height:h}=canvasSize(this.canvas.clientWidth,this.canvas.clientHeight,dpr,this.quality);
+  if(this.canvas.width!==w||this.canvas.height!==h){this.canvas.width=w;this.canvas.height=h;}this.gl.viewport(0,0,w,h);
+  return Math.max(w/h,1e-3);
+ }
+ begin(cam,view,fov=76,env=null,time=0){
+  const gl=this.gl,aspect=this.resize();this.proj=perspective(fov*Math.PI/180,aspect,.045,1050);
+  this.view=view;this.eye=cam;this.env=env;this.time=time;
+  gl.clearColor(...(env?.clear??this.clear),1);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+  gl.disable(gl.DEPTH_TEST);gl.depthMask(false);gl.useProgram(this.skyProgram);
+  gl.uniform3fv(this.su.uTop,env?.skyTop??[.12,.16,.28]);
+  gl.uniform3fv(this.su.uHorizon,env?.skyHorizon??[.28,.20,.24]);
+  gl.uniform3fv(this.su.uGlow,env?.skyGlow??[1,.67,.46]);
+  gl.uniform2fv(this.su.uSunPos,env?.sunPos??[.68,.42]);
+  gl.uniform1f(this.su.uSunStrength,env?.sunStrength??.7);
+  gl.uniform1f(this.su.uTime,time);
+  gl.uniform1f(this.su.uAspect,aspect);
+  gl.bindVertexArray(this.skyVAO);gl.drawArrays(gl.TRIANGLES,0,3);gl.bindVertexArray(null);
+  gl.depthMask(true);gl.enable(gl.DEPTH_TEST);gl.useProgram(this.program);gl.uniformMatrix4fv(this.u.uProjection,false,this.proj);
+  gl.uniformMatrix4fv(this.u.uView,false,view);gl.uniformMatrix4fv(this.u.uModel,false,IDENTITY);
+  gl.uniform3fv(this.u.uEye,cam);gl.uniform3fv(this.u.uFogColor,env?.fog??[.095,.12,.23]);
+  gl.uniform3fv(this.u.uSun,env?.sun??[.42,.83,-.42]);gl.uniform1f(this.u.uFogAmount,env?.fogAmount??.0020);
+  gl.uniform1f(this.u.uMaterialQuality,this.quality==='low'?0:1);
+ }
+ draw(mesh,model=IDENTITY){
+  if(!mesh||!mesh.count)return;
+  const gl=this.gl;gl.useProgram(this.program);gl.uniformMatrix4fv(this.u.uModel,false,model);
+  gl.bindVertexArray(mesh.vao);gl.drawArrays(gl.TRIANGLES,0,mesh.count);
+ }
+ // Procedural water plane is two triangles per streaming world chunk: constant geometry cost.
+ waterPatch(x0,x1,z0,z1,y){
+  const b=new MeshBuilder();
+  b.quad([x0,y,z0],[x0,y,z1],[x1,y,z1],[x1,y,z0],'#39768c');
+  return this.mesh(b);
+ }
+ drawWater(mesh,chapter){
+  if(!mesh||!mesh.count)return;
+  const g=this.gl,u=this.wu,e=this.env||{};
+  g.useProgram(this.waterProgram);
+  g.uniformMatrix4fv(u.uProjection,false,this.proj);
+  g.uniformMatrix4fv(u.uView,false,this.view);
+  g.uniform3fv(u.uEye,this.eye);
+  g.uniform3fv(u.uFogColor,e.fog??[.10,.13,.22]);
+  g.uniform3fv(u.uSun,e.sun??[.72,.64,-.3]);
+  g.uniform3fv(u.uSkyTop,e.skyTop??[.2,.3,.5]);
+  g.uniform3fv(u.uSkyHorizon,e.skyHorizon??[.8,.5,.35]);
+  g.uniform3fv(u.uSkyGlow,e.skyGlow??[1,.75,.5]);
+  g.uniform1f(u.uFogAmount,e.fogAmount??.002);
+  g.uniform1f(u.uTime,this.time);
+  g.uniform1f(u.uChapter,chapter);
+  g.uniform1f(u.uWaterQuality,this.quality==='low'?0:1);
+  g.bindVertexArray(mesh.vao);g.drawArrays(g.TRIANGLES,0,mesh.count);
+  g.bindVertexArray(null);
+ }
+ drawRain(cam,view,time){
+  const gl=this.gl;gl.useProgram(this.rainProgram);gl.uniformMatrix4fv(this.ru.uProjection,false,this.proj);
+  gl.uniformMatrix4fv(this.ru.uView,false,view);gl.uniform3fv(this.ru.uEye,cam);gl.uniform1f(this.ru.uTime,time);
+  gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE);gl.depthMask(false);
+  gl.bindVertexArray(this.rain.vao);gl.drawArrays(gl.POINTS,0,Math.min(this.rain.count,QUALITY[this.quality].rain));
+  gl.depthMask(true);gl.disable(gl.BLEND);
+ }
+ makeRain(){
+  const gl=this.gl,p=[];
+  for(let i=0;i<980;i++){
+   p.push(Math.sin(i*91.71)*29,Math.sin(i*16.78)*11,Math.cos(i*37.14)*48-15);
+  }
+  const vao=gl.createVertexArray(),vbo=gl.createBuffer();gl.bindVertexArray(vao);gl.bindBuffer(gl.ARRAY_BUFFER,vbo);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(p),gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,3,gl.FLOAT,false,12,0);gl.bindVertexArray(null);
+  return {vao,vbo,count:p.length/3};
+ }
+}

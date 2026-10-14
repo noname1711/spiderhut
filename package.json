@@ -1,0 +1,11 @@
+{
+  "name": "the-last-swing-hanoi-webgl-3d",
+  "version": "2.37.0",
+  "private": true,
+  "type": "module",
+  "description": "A free, self-contained WebGL2 3D rooftop swinging game",
+  "scripts": {
+    "serve": "python3 -m http.server 8000",
+    "test": "node --test tests/*.test.js"
+  }
+}
